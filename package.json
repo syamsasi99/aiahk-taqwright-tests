@@ -1,0 +1,16 @@
+{
+  "name": "aiahk-taqwright-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "UI tests for the AIA+ HK Android app, written with Taqwright",
+  "scripts": {
+    "test": "taqwright",
+    "test:android": "taqwright --project=android",
+    "typecheck": "tsc --noEmit",
+    "test:local": "taqwright --project=android-local"
+  },
+  "devDependencies": {
+    "@taqwright/taqwright": "^1.0.1",
+    "typescript": "^5.0.0"
+  }
+}

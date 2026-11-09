@@ -1,0 +1,409 @@
+# Runs this suite on TestMu AI (LambdaTest) real devices and reports the results
+# back to Taqwright LIME.
+#
+# Two triggers, deliberately:
+#   workflow_dispatch  — run it by hand, or from the app repository once its build
+#                        pipeline uploads an APK/IPA and knows the app id.
+#   pull_request       — every PR that changes a test runs it before it merges.
+#
+# SECRETS (Settings -> Secrets and variables -> Actions):
+#   LAMBDATEST_USERNAME     the grid account
+#   LAMBDATEST_ACCESS_KEY   its access key
+#   LIME_CI_TOKEN           created in LIME under Settings -> CI token
+#
+# VARIABLES (same page, Variables tab) — not secrets, so they stay readable in the
+# log, which is what you want when a session fails to allocate:
+#   LT_ANDROID_DEVICE / LT_ANDROID_OS / LT_IOS_DEVICE / LT_IOS_OS
+#
+# The app id defaults to the one in taqwright.config.ts. `app_id` overrides it, which
+# is how the app repository will point a run at the build it just uploaded.
+
+name: taqwright-tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: Which taqwright project to run
+        required: false
+        default: android
+        type: choice
+        options: [android]
+      app_id:
+        description: "lt:// app id to test (blank = the one in taqwright.config.ts)"
+        required: false
+      commit:
+        description: Commit of the APP being tested (blank = this repo's HEAD)
+        required: false
+      branch:
+        description: Branch of the APP being tested
+        required: false
+  pull_request:
+    branches: [main]
+
+# One suite run at a time per ref. A cloud grid bills per session, and two runs of
+# the same branch racing each other pay twice to answer the same question.
+concurrency:
+  group: taqwright-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # WHERE THIS RUNS. `ubuntu-latest` unless you say otherwise, because nothing here
+    # needs a Mac — the suite drives the TestMu AI grid and the handset is theirs, not
+    # this runner's.
+    #
+    # To use your own machines, set a repository VARIABLE (Settings → Secrets and
+    # variables → Actions → Variables):
+    #
+    #   LIME_RUNNER = ["self-hosted","macOS","ARM64"]
+    #
+    # A JSON ARRAY because labels come in sets: a self-hosted job names several, and
+    # `runs-on: self-hosted` would match any runner carrying that one label. Labels are
+    # matched LITERALLY — `macos` or `x64` queue for ever against a runner reporting
+    # `macOS` and `ARM64`.
+    #
+    # The SAME variable `taqwright-automate.yml` reads, deliberately: one answer to
+    # "whose machines", given once, rather than one per workflow.
+    #
+    # Self-hosted runners and public repositories do not mix — a fork's pull request
+    # would run on your hardware. Keep this default unless this repository is private.
+    runs-on: ${{ fromJSON(vars.LIME_RUNNER || '["ubuntu-latest"]') }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the step below diffs this branch against the pull request's
+          # base, and the default shallow clone has no base commit to diff against.
+          fetch-depth: 0
+
+      # WHICH SPECS THIS PULL REQUEST IS ABOUT.
+      #
+      # A suite run costs device-minutes PER TEST, and parallelism buys latency, not
+      # billing: a hundred tests cost a hundred tests' worth whether they run 5-wide or
+      # 1-wide. An automated scenario adds ONE spec, so running the other hundred to
+      # answer "does this new test pass?" is paid for on every pull request LIME opens.
+      #
+      # Specs only, never importers. A pull request from `automate` also edits a page
+      # object, and page objects are SHARED -- a login page object is typically imported by
+      # every spec in a suite, because every test signs in. Selecting importers of a changed
+      # page object would therefore select the whole suite on nearly every automated pull
+      # request, which is the cost this step exists to avoid.
+      #
+      # THE TRADE, stated rather than hidden: a change to a shared page object can break a
+      # spec this step did not select, and this run will not catch it. regression.yml runs
+      # the whole suite on `main` and nightly, so that surfaces after merge instead of
+      # before. That net is the only reason narrowing here is safe.
+      #
+      # workflow_dispatch is deliberately NOT narrowed: running it by hand is the
+      # deliberate "run everything" act and needs no flag of its own.
+      - name: Which specs to run
+        id: scope
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "specs=" >> "$GITHUB_OUTPUT"
+            echo "Not a pull request - running the whole suite."
+            exit 0
+          fi
+          BASE="origin/${{ github.base_ref }}"
+          git fetch --no-tags origin "${{ github.base_ref }}" >/dev/null 2>&1 || true
+          # Filtered with grep, NOT a git pathspec. `-- 'tests/**/*.spec.ts'` looks right
+          # and matches NOTHING here: pathspec `**` still requires the `/` after it, so it
+          # only matches specs in a SUBdirectory, and this repository keeps them directly
+          # in tests/. That failure is silent AND GREEN -- every pull request would select
+          # no tests and pass. grep has no such subtlety and finds specs at any depth.
+          # `|| true` because grep exits 1 on no match and this step runs under -e.
+          # `--diff-filter=d` drops deletions: a spec this branch removed cannot be run.
+          SPECS=$(git diff --name-only --diff-filter=d "$BASE...HEAD" | grep -E "\.spec\.ts$" | tr "\n" " " || true)
+          if [ -z "$(echo "$SPECS" | tr -d ' ')" ]; then
+            echo "specs=NONE" >> "$GITHUB_OUTPUT"
+            echo "No spec files changed in this pull request."
+            echo "### No tests selected" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "This pull request changed no spec files. The suite runs in full on \`main\` and nightly." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "specs=$SPECS" >> "$GITHUB_OUTPUT"
+          echo "Selected: $SPECS"
+          # SAY WHAT WAS SELECTED. A narrowed run that does not show its selection is a
+          # green tick over an unknown amount of testing.
+          {
+            echo "### Tests selected for this pull request"
+            echo ""
+            for f in $SPECS; do echo "- \`$f\`"; done
+            echo ""
+            echo "The rest of the suite runs on \`main\` and on the nightly schedule."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # No `cache: npm` — this repository has no lock file, and setup-node fails
+      # outright rather than skipping the cache when it cannot find one. Add a
+      # package-lock.json and the cache (plus a real `npm ci`) can come back.
+      # 24, because @taqwright/taqwright declares `engines: node >= 24.0.0` and its
+      # undici 8 dependency needs >= 22.19.0. On Node 20 the suite dies at module
+      # load with `webidl.util.markAsUncloneable is not a function` — before any
+      # device is touched, so it reads like a taqwright bug rather than a runtime.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install
+        run: |
+          npm ci || npm install
+          npm install -g @taqwright/lime-cli
+
+      # Fail here rather than three minutes into a device allocation. The check never
+      # prints a value: these are the two that unlock the whole grid account.
+      - name: Check the credentials are there
+        env:
+          LAMBDATEST_USERNAME: ${{ secrets.LAMBDATEST_USERNAME }}
+          LAMBDATEST_ACCESS_KEY: ${{ secrets.LAMBDATEST_ACCESS_KEY }}
+        run: |
+          [ -n "${LAMBDATEST_USERNAME:-}" ] && [ -n "${LAMBDATEST_ACCESS_KEY:-}" ] || {
+            echo "::error::LAMBDATEST_USERNAME and LAMBDATEST_ACCESS_KEY must both be set." >&2
+            exit 1
+          }
+
+      # WHICH BUILD THIS RUN INSTALLS — decided ONCE, here, for the suite and the report.
+      #
+      # A generated test is only evidence about the build its recording came from. On a
+      # `pull_request` there are no inputs, so the suite installed taqwright.config.ts's
+      # default instead — a DIFFERENT binary. Measured 16 Sep: a test failed on a login field
+      # whose resource-id the default build has not got.
+      #
+      # AND THE TWO USED TO BE WORKED OUT SEPARATELY. `LT_APP_ID` for the report fell through
+      # an input and a repository variable that is not set, landing on '' — so the pull
+      # request summary named NO build while the suite quietly installed the config default.
+      # taqwright.config.ts has always warned about exactly that: "the workflow must also tell
+      # LIME which build it ran and it cannot read this file. The two have to name the same
+      # build or a report describes something the suite did not install." One value now, so
+      # they cannot disagree.
+      #
+      # THE RUN ID IS IN THE BRANCH NAME. taqwright-automate pushes
+      # `taqwright/run-<LIME run id>-<gh run id>[-rN]`, so nothing has to be committed to
+      # carry the build id — which matters, because `.lime/` is gitignored on purpose: it
+      # holds the text typed into the app, and that routinely includes credentials.
+      #
+      # NEVER FATAL, AND NEVER SILENT. Everything that stops it pinning falls back to the
+      # configured default and says which and why. "We could not tell" is a warning; "there is
+      # nothing to pin to" is a notice. A silent fallback is the bug this removes.
+      - name: Which build this run installs
+        id: build
+        env:
+          LIME_CI_TOKEN: ${{ secrets.LIME_CI_TOKEN }}
+          LIME_SERVER: ${{ vars.LIME_SERVER || 'https://www.taqwright.ai' }}
+          INPUT_APP_ID: ${{ inputs.app_id }}
+          VAR_APP_ID: ${{ vars.LT_APP_ID_ANDROID }}
+          PROJECT: ${{ inputs.project || 'android' }}
+          EVENT: ${{ github.event_name }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -uo pipefail
+          APP_ID=""
+          SOURCE=""
+          PINNED="false"
+
+          # 1. An explicit choice for THIS run outranks everything: somebody typed it.
+          if [ -n "${INPUT_APP_ID:-}" ]; then
+            APP_ID="$INPUT_APP_ID"; SOURCE="the app id this run was dispatched with"
+          fi
+
+          # 2. The build the test was RECORDED from, for an automated recording branch.
+          if [ -z "$APP_ID" ] && [ "$EVENT" = "pull_request" ]; then
+            RUN_ID="$(printf '%s' "${BRANCH:-}" | sed -n 's|^taqwright/run-\([0-9][0-9]*\)-.*|\1|p')"
+            if [ -z "$RUN_ID" ]; then
+              echo "::notice::${BRANCH:-this branch} is not an automated recording branch, so there is no recording to pin to."
+            elif [ -z "${LIME_CI_TOKEN:-}" ]; then
+              echo "::warning::LIME_CI_TOKEN is not set, so the build this test was recorded from could not be read."
+            else
+              # Deliberately not `curl -f`: it exits before the body can be read, so a
+              # rejected token would report as "exit code 22" rather than as a sentence.
+              CODE=$(curl -sS -o /tmp/lime-run.json -w '%{http_code}' \
+                -H "Authorization: Bearer $LIME_CI_TOKEN" \
+                "${LIME_SERVER}/api/cli/runs/${RUN_ID}" || echo 000)
+              if [ "$CODE" != "200" ]; then
+                echo "::warning::${LIME_SERVER} answered $CODE for run ${RUN_ID}, so the recorded build could not be read."
+              else
+                FOUND="$(jq -r '.run.appBuildId // ""' /tmp/lime-run.json 2>/dev/null || echo "")"
+                if [ -n "$FOUND" ] && [ "$FOUND" != "null" ]; then
+                  APP_ID="$FOUND"; SOURCE="the build run ${RUN_ID} was recorded on"; PINNED="true"
+                else
+                  # '' is an ANSWER: a bridged or local recording had no cloud build, and a
+                  # run recorded before LIME stored the field has none either. Both are
+                  # "nothing to pin", and neither is an error.
+                  echo "::notice::Run ${RUN_ID} recorded no cloud build, so there is nothing to pin to."
+                fi
+              fi
+            fi
+          fi
+
+          # 3. The repository's standing default, for runs that are neither.
+          if [ -z "$APP_ID" ] && [ -n "${VAR_APP_ID:-}" ]; then
+            APP_ID="$VAR_APP_ID"; SOURCE="the repository default"
+          fi
+
+          # 4. And last, what taqwright.config.ts will install if nobody sets the env var —
+          #    read so the REPORT can name it. The suite installs this whether or not we look,
+          #    so not looking is how the summary came to name no build at all. Android only:
+          #    the iOS project has no spec yet, and guessing its default from the same file
+          #    would name the wrong binary the day it gets one.
+          if [ -z "$APP_ID" ] && [ "$PROJECT" != "ios" ] && [ -f taqwright.config.ts ]; then
+            APP_ID="$(grep -oE "lt://APP[A-Za-z0-9]+" taqwright.config.ts | head -1 || true)"
+            [ -n "$APP_ID" ] && SOURCE="the default in taqwright.config.ts"
+          fi
+
+          if [ -z "$APP_ID" ]; then
+            echo "::warning::No app id could be determined, so the report will not name a build."
+            exit 0
+          fi
+
+          echo "app_id=$APP_ID" >> "$GITHUB_OUTPUT"
+          echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
+          # PINNED means "this is the build the test was written from". Anything else is a
+          # stand-in, and a failure on a stand-in may be about the build rather than the test
+          # — which is what the report says, so nobody reads a red PR as a broken test. Set
+          # where it is KNOWN, never reconstructed by matching the sentence above.
+          echo "pinned=$PINNED" >> "$GITHUB_OUTPUT"
+          echo "::notice::Installing ${APP_ID} — ${SOURCE}."
+
+      # `|| true` is deliberate: a FAILING TEST IS A RESULT, and the reporting step
+      # below must still run and post it. The job's own verdict is set at the end from
+      # the saved exit code, so a red suite still turns this job red.
+      - name: Run the suite on TestMu AI
+        id: run
+        env:
+          LAMBDATEST_USERNAME: ${{ secrets.LAMBDATEST_USERNAME }}
+          LAMBDATEST_ACCESS_KEY: ${{ secrets.LAMBDATEST_ACCESS_KEY }}
+          LT_ANDROID_DEVICE: ${{ vars.LT_ANDROID_DEVICE }}
+          LT_ANDROID_OS: ${{ vars.LT_ANDROID_OS }}
+          LT_IOS_DEVICE: ${{ vars.LT_IOS_DEVICE }}
+          LT_IOS_OS: ${{ vars.LT_IOS_OS }}
+          LT_APP_ID_ANDROID: ${{ steps.build.outputs.app_id }}
+          PROJECT: ${{ inputs.project || 'android' }}
+          # The `${NAME}` variables the goal was recorded with. The recorded spec
+          # reads them from the environment rather than carrying the values, which
+          # is the whole point of the contract — the text typed into the app never
+          # reaches the repository.
+          # ── EDIT ME ──────────────────────────────────────────────────────────
+          # One line per ${NAME} your recordings use. The name on the left is what
+          # the spec reads; the secret on the right is where the value lives. Add
+          # the same pair to the other workflow, or the suite passes on one trigger
+          # and fails on the other.
+          APP_USER: ${{ secrets.APP_USER }}
+          APP_PASS: ${{ secrets.APP_PASS }}
+          # Playwright's json reporter writes to STDOUT unless this names a file.
+          # Stdout is not usable here: taqwright pipes the runner's output through a
+          # branding rewrite, so a redirect captures branded text, not clean JSON.
+          # `env` is forwarded to the spawned runner, so this reaches the reporter.
+          PLAYWRIGHT_JSON_OUTPUT_NAME: results.json
+        run: |
+          set +e
+          # Empty for a dispatch (whole suite); a space-separated list for a pull
+          # request. `--pass-with-no-tests` because a selection of NONE must be green,
+          # not "no tests found" red.
+          SPECS="${{ steps.scope.outputs.specs }}"
+          [ "$SPECS" = "NONE" ] && SPECS=""
+          npx taqwright test $SPECS --project "$PROJECT" --reporter json --pass-with-no-tests
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          set -e
+          echo "Wrote $(wc -c < results.json 2>/dev/null || echo 0) bytes of results."
+
+      # Always, including on failure — a red suite is exactly the result worth having
+      # on the board. `lime-cli report` reads the Playwright JSON, asks TestMu AI which
+      # sessions belong to THIS GitHub run (taqwright stamps the run id into the build
+      # name), and posts one batch to /api/ci/results.
+      #
+      # The commit and branch describe the APP under test, not this repository, so the
+      # results pair with the app's pull request on the LIME board.
+      #
+      # On a pull_request event `github.sha` is the EPHEMERAL MERGE COMMIT GitHub
+      # synthesises and `github.ref_name` is "<n>/merge" — neither exists in anyone's
+      # history, so the board could never pair the run to the pull request and the rail
+      # kept saying NOT TESTED above a run that had passed. head.sha / head.ref are the
+      # real ones; they are empty on other events, hence the fallback.
+      - name: Report the results to LIME
+        if: always()
+        env:
+          LIME_CI_TOKEN: ${{ secrets.LIME_CI_TOKEN }}
+          LAMBDATEST_USERNAME: ${{ secrets.LAMBDATEST_USERNAME }}
+          LAMBDATEST_ACCESS_KEY: ${{ secrets.LAMBDATEST_ACCESS_KEY }}
+          # The same four the test step reads, so the board names the handset the suite
+          # actually asked for rather than a second copy of the answer.
+          LT_ANDROID_DEVICE: ${{ vars.LT_ANDROID_DEVICE }}
+          LT_ANDROID_OS: ${{ vars.LT_ANDROID_OS }}
+          LT_IOS_DEVICE: ${{ vars.LT_IOS_DEVICE }}
+          LT_IOS_OS: ${{ vars.LT_IOS_OS }}
+          # Dispatch input first: it is an explicit choice for THIS run. Then the repository
+          # variable, for every run nobody chose one. Blank if neither, and the board then
+          # shows no build rather than a guessed one.
+          # THE SAME VALUE THE SUITE INSTALLED, by construction rather than by a second
+          # fall-through that could land somewhere else. It used to resolve independently and
+          # reach '' on a pull request, so the summary named no build while the suite ran one.
+          LT_APP_ID: ${{ steps.build.outputs.app_id }}
+          # And whether that was the build this test was WRITTEN from. A failure on a stand-in
+          # build may be about the build rather than the test, and a red pull request that
+          # does not say so gets read as a broken test — twice, on 16 Sep.
+          LT_APP_PINNED: ${{ steps.build.outputs.pinned }}
+          LT_APP_SOURCE: ${{ steps.build.outputs.source }}
+          # Declared HERE too. `PROJECT` on the test step above is scoped to that step, so
+          # without this the comparison below reads an empty string and every run reports an
+          # Android handset -- including the iOS ones.
+          PROJECT: ${{ inputs.project || 'android' }}
+        run: |
+          [ -f results.json ] || { echo "No results.json — the suite did not get far enough to report."; exit 0; }
+
+          # WHAT IT RAN ON, for the Reports canvas and the pull request summary. Neither is
+          # derivable at the other end: this runner is an ubuntu box, not the handset, and
+          # Playwright's json reporter does not serialise a project's `use` options, so
+          # taqwright.config.ts's own device is not in results.json either.
+          #
+          # `${VAR:+…}` on purpose: an UNSET variable produces an empty string and LIME then
+          # omits the column entirely, which is the honest answer. Written the other way, an
+          # unset device would report " · Android " and put a half-empty label on every row.
+          if [ "$PROJECT" = "ios" ]; then
+            DEVICE="${LT_IOS_DEVICE:+$LT_IOS_DEVICE · iOS $LT_IOS_OS}"
+          else
+            DEVICE="${LT_ANDROID_DEVICE:+$LT_ANDROID_DEVICE · Android $LT_ANDROID_OS}"
+          fi
+
+          # WHAT IT RAN ON, in one string: the build, and whether it is the recorded one.
+          # `lime-cli report --app-version` is free text that LIME renders as `build \`...\``
+          # in the pull request summary, so a stand-in can say it is one right there, beside
+          # the device and the OS version, where somebody reading a red PR will see it.
+          APP_VERSION="$LT_APP_ID"
+          if [ -n "$APP_VERSION" ] && [ "${LT_APP_PINNED:-false}" != "true" ]; then
+            APP_VERSION="$APP_VERSION (not the recorded build — ${LT_APP_SOURCE:-a stand-in})"
+          fi
+
+          lime-cli report \
+            --results results.json \
+            --screens lime-screens \
+            --platform "${{ inputs.project || 'android' }}" \
+            --commit "${{ inputs.commit || github.event.pull_request.head.sha || github.sha }}" \
+            --branch "${{ inputs.branch || github.event.pull_request.head.ref || github.ref_name }}" \
+            --actor "${{ github.actor }}" \
+            --device "$DEVICE" \
+            --app-version "$APP_VERSION" \
+            --run-id "${{ github.run_id }}"
+
+      # Kept so a failing suite fails the job. The report above has already been sent
+      # by the time this runs.
+      - name: Fail if the suite failed
+        if: always() && steps.run.outputs.exit_code != '0'
+        run: |
+          echo "::error::The suite failed (exit ${{ steps.run.outputs.exit_code }}). The results were still reported to LIME."
+          exit 1
+
+      - name: Keep the raw results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: taqwright-results
+          path: results.json
+          if-no-files-found: ignore
+          # SEVEN DAYS, NOT NINETY. Artifact storage is billed wherever the job ran, so a
+          # self-hosted runner saves the minutes and none of this. The file has one reader
+          # and it has already read it: `lime-cli report` posts these results to LIME in the
+          # step above, and the board is where anybody looks afterwards. What is kept here
+          # is the raw copy for the week in which somebody might want to re-read the run by
+          # hand -- after that it is a duplicate of something LIME holds for ninety days.
+          retention-days: 7

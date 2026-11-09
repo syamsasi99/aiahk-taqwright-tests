@@ -1,0 +1,390 @@
+# regression — run this suite on demand, against a device and build you choose.
+#
+# taqwright-tests.yml is the AUTOMATIC one: it runs on every pull request, on the repository
+# variables, and answers "did this change break the suite". This one is the opposite — nothing
+# is implied, every knob is an input, and it answers "does build X still pass on device Y".
+#
+# Use it to qualify a release candidate, to reproduce a failure on the exact handset a
+# customer saw it on, or to sweep both platforms before a launch.
+#
+# ── Every input falls back the same way ───────────────────────────────────────────────
+#     dispatch input  ->  repository variable  ->  taqwright.config.ts default
+#
+# Leave a field blank and the layer below answers, so a run with nothing filled in is
+# exactly today's default configuration.
+#
+# THE DEFAULTS ARE IN THE LABELS, NOT IN `default:`, for two reasons. One `device` field
+# serves both platforms, so a literal default of "Galaxy S24" would be sent to an iOS run
+# as well. And a pre-filled input always wins the fallback above it, which would make the
+# LT_* repository variables dead config — change one and nothing would happen. `||` not `??` throughout: an unfilled dispatch
+# input arrives as an EMPTY STRING, and the config file was bitten by this already —
+# see the comment above `buildPath` in taqwright.config.ts.
+#
+# ── Secrets ───────────────────────────────────────────────────────────────────────────
+#   LAMBDATEST_USERNAME / LAMBDATEST_ACCESS_KEY   the TestMu AI grid account
+#   LIME_CI_TOKEN                                 console -> Settings -> CI token
+#   APP_USER / APP_PASS                           the ${NAME} values your specs read
+#                                                 (rename these to match your recordings)
+#
+# ── Two things that bite ──────────────────────────────────────────────────────────────
+# The CI token expires after 90 DAYS and there is one per user, so regenerating it in the
+# console silently invalidates this secret. Reporting never fails a build, so the symptom
+# is a green job and an unchanged board — check the report step's log line, not the tick.
+#
+# The nightly `schedule:` below is COMMENTED OUT. A template that starts billing a grid
+# account the day it is copied is a template nobody trusts — turn it on deliberately.
+
+name: regression
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_name:
+        description: 'Name this run — blank shows the branch, which two runs of main share'
+        required: false
+      platform:
+        description: Which platform to run
+        required: true
+        default: android
+        type: choice
+        options: [android]
+      device:
+        description: 'Device — blank uses Galaxy S24'
+        required: false
+      os_version:
+        description: 'OS version — blank uses 16'
+        required: false
+      app_id:
+        description: 'Build — blank uses lt://APP1016034431791954062358902'
+        required: false
+      grep:
+        description: 'Run only tests whose title matches — blank runs the whole suite'
+        required: false
+      app_commit:
+        description: "Commit of the APP under test (not this repo) — blank uses this repo's HEAD, which pairs with nothing"
+        required: false
+      app_branch:
+        description: "Branch of the APP under test — blank uses this repo's branch"
+        required: false
+      report:
+        description: Report the results to LIME
+        required: false
+        default: true
+        type: boolean
+
+  # A nightly sweep of the default configuration, OFF by default. Uncomment once the
+  # secrets are in and a manual run has passed — every night of this bills real device
+  # sessions, and a run nobody is waiting for is the easiest spend to forget about.
+  # Everything else here works on demand alone.
+  # schedule:
+  #   - cron: '0 2 * * *'
+
+# One regression run at a time per platform. A cloud grid bills per session, and two runs
+# racing each other pay twice to answer the same question.
+concurrency:
+  group: regression-${{ github.ref }}-${{ inputs.platform || 'android' }}
+  cancel-in-progress: false
+
+# THE BUILD THESE TESTS RUN AGAINST when nothing names one. Declared here, once, as the
+# workflow's own answer -- because the `app_id` input above promises this exact id in its
+# description, and a promise made by a workflow should be kept by the same workflow rather
+# than by a fallback in a config file it never reads.
+#
+# It used to be kept only in taqwright.config.ts, which the SUITE reads and the REPORTER
+# does not. So a run with no input installed lt://APP1016... and reported an empty build,
+# and LIME's "did the app change since this test last passed" question had nothing to
+# compare -- on every scheduled and pull_request run, which is nearly all of them.
+#
+# Both platforms now name a real uploaded build. Neither may be invented: an id here is
+# what the reporter tells LIME was installed, so a value no provider can resolve reports a
+# build that never ran.
+env:
+  DEFAULT_APP_ID_ANDROID: lt://APP1016034431791954062358902
+  # Empty: Android only for now (no IPA). An empty default is skipped by the drift check.
+  DEFAULT_APP_ID_IOS: ''
+
+jobs:
+  # `both` becomes a two-leg matrix; a single platform becomes a one-leg one. Done here
+  # rather than with an `if:` per step so the two platforms get separate jobs, separate
+  # logs and separate board rows — which is what you want when one of them fails.
+  plan:
+    # WHERE THIS RUNS. `ubuntu-latest` unless you say otherwise, because nothing here
+    # needs a Mac — the suite drives the TestMu AI grid and the handset is theirs, not
+    # this runner's.
+    #
+    # To use your own machines, set a repository VARIABLE (Settings → Secrets and
+    # variables → Actions → Variables):
+    #
+    #   LIME_RUNNER = ["self-hosted","macOS","ARM64"]
+    #
+    # A JSON ARRAY because labels come in sets: a self-hosted job names several, and
+    # `runs-on: self-hosted` would match any runner carrying that one label. Labels are
+    # matched LITERALLY — `macos` or `x64` queue for ever against a runner reporting
+    # `macOS` and `ARM64`.
+    #
+    # The SAME variable `taqwright-automate.yml` reads, deliberately: one answer to
+    # "whose machines", given once, rather than one per workflow.
+    #
+    # Self-hosted runners and public repositories do not mix — a fork's pull request
+    # would run on your hardware. Keep this default unless this repository is private.
+    runs-on: ${{ fromJSON(vars.LIME_RUNNER || '["ubuntu-latest"]') }}
+    outputs:
+      platforms: ${{ steps.pick.outputs.platforms }}
+    steps:
+      - id: pick
+        run: |
+          case "${{ inputs.platform || 'android' }}" in
+            both) echo 'platforms=["android","ios"]' >> "$GITHUB_OUTPUT" ;;
+            ios)  echo 'platforms=["ios"]'           >> "$GITHUB_OUTPUT" ;;
+            *)    echo 'platforms=["android"]'       >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  run:
+    needs: plan
+    strategy:
+      fail-fast: false          # one platform failing must not cancel the other
+      matrix:
+        platform: ${{ fromJSON(needs.plan.outputs.platforms) }}
+    # WHERE THIS RUNS. `ubuntu-latest` unless you say otherwise, because nothing here
+    # needs a Mac — the suite drives the TestMu AI grid and the handset is theirs, not
+    # this runner's.
+    #
+    # To use your own machines, set a repository VARIABLE (Settings → Secrets and
+    # variables → Actions → Variables):
+    #
+    #   LIME_RUNNER = ["self-hosted","macOS","ARM64"]
+    #
+    # A JSON ARRAY because labels come in sets: a self-hosted job names several, and
+    # `runs-on: self-hosted` would match any runner carrying that one label. Labels are
+    # matched LITERALLY — `macos` or `x64` queue for ever against a runner reporting
+    # `macOS` and `ARM64`.
+    #
+    # The SAME variable `taqwright-automate.yml` reads, deliberately: one answer to
+    # "whose machines", given once, rather than one per workflow.
+    #
+    # Self-hosted runners and public repositories do not mix — a fork's pull request
+    # would run on your hardware. Keep this default unless this repository is private.
+    runs-on: ${{ fromJSON(vars.LIME_RUNNER || '["ubuntu-latest"]') }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # 24, because @taqwright/taqwright declares engines node >= 24. On Node 20 the suite
+      # dies at module load, before any device is touched, and it reads like a taqwright bug.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install
+        run: |
+          npm ci || npm install
+          npm install -g @taqwright/lime-cli
+
+      # Fail here rather than three minutes into a device allocation. Never prints a value.
+      - name: Check the credentials are there
+        env:
+          LAMBDATEST_USERNAME: ${{ secrets.LAMBDATEST_USERNAME }}
+          LAMBDATEST_ACCESS_KEY: ${{ secrets.LAMBDATEST_ACCESS_KEY }}
+        run: |
+          [ -n "${LAMBDATEST_USERNAME:-}" ] && [ -n "${LAMBDATEST_ACCESS_KEY:-}" ] || {
+            echo "::error::LAMBDATEST_USERNAME and LAMBDATEST_ACCESS_KEY must both be set." >&2
+            exit 1
+          }
+
+      # Say what this run is about to do, before it spends a session. A regression run is
+      # usually started to answer a specific question, and the answer is worthless if you
+      # cannot see which device and which build it actually used.
+      - name: What this run will do
+        env:
+          DEVICE: ${{ inputs.device }}
+          OS_VERSION: ${{ inputs.os_version }}
+          # RESOLVED, not raw. This step exists to say which build is about to be
+          # installed, and `<configured default>` was not that -- it named a file this
+          # log cannot show you, which is precisely how the build came to be missing from
+          # the report without anyone noticing.
+          APP_ID_ANDROID: ${{ inputs.app_id || vars.LT_APP_ID_ANDROID || env.DEFAULT_APP_ID_ANDROID }}
+          APP_ID_IOS: ${{ inputs.app_id || vars.LT_APP_ID_IOS || env.DEFAULT_APP_ID_IOS }}
+        run: |
+          if [ "${{ matrix.platform }}" = "ios" ]; then APP_ID="$APP_ID_IOS"; else APP_ID="$APP_ID_ANDROID"; fi
+          echo "platform : ${{ matrix.platform }}"
+          echo "device   : ${DEVICE:-<configured default>}"
+          echo "os       : ${OS_VERSION:-<configured default>}"
+          echo "build    : ${APP_ID:-<none — the suite will not find an app>}"
+          echo "grep     : ${{ inputs.grep || '<whole suite>' }}"
+          echo "name     : ${{ inputs.run_name || '<the branch>' }}"
+
+      # TWO FILES NAME A DEFAULT BUILD and they must agree. This workflow's
+      # DEFAULT_APP_ID_ANDROID is what CI installs and reports; taqwright.config.ts keeps
+      # its own literal so the suite still runs on a laptop with nothing exported. Neither
+      # can be deleted, so the only remaining question is whether they have drifted -- and
+      # drift here is silent, because both values are valid app ids and the suite passes
+      # either way while the report names the wrong build.
+      #
+      # A red check is cheaper than a green run that tested something else.
+      - name: The two default builds must agree
+        run: |
+          # Per PLATFORM. iOS used to be exempt by being empty, and an empty default
+          # cannot drift; now that it names a real build it can, in exactly the way
+          # Android already did.
+          fail=0
+          for pair in "ANDROID:$DEFAULT_APP_ID_ANDROID" "IOS:$DEFAULT_APP_ID_IOS"; do
+            plat="${pair%%:*}"; id="${pair#*:}"
+            [ -n "$id" ] || continue
+            grep -qF "$id" taqwright.config.ts || {
+              echo "::error file=taqwright.config.ts::the config's default $plat build is not $id (regression.yml). Update whichever is stale."
+              fail=1
+            }
+          done
+          # Both are reported, not just the first: being told about one stale id, fixing
+          # it and then being told about the other is two red runs for one mistake.
+          exit $fail
+
+      # TELL LIME THE RUN HAS BEGUN, before the device is allocated.
+      #
+      # Results only arrive when a suite has finished, so without this the Reports board
+      # shows nothing for the ninety seconds a run takes — and no way to tell "running"
+      # from "nothing happened". This posts the envelope with no results, which is enough
+      # for the rail to show the run live.
+      #
+      # Entirely optional, and it cannot fail the job: a refused post, an unreachable
+      # server and a missing run id all warn and exit 0. Skip it and the run simply appears
+      # the moment it reports, as it did before.
+      #
+      # Same --title as the report below, so the row is named from the start rather than
+      # being renamed halfway through.
+      - name: Tell LIME the run has begun
+        if: inputs.report != false
+        env:
+          LIME_CI_TOKEN: ${{ secrets.LIME_CI_TOKEN }}
+          RUN_NAME: ${{ inputs.run_name }}
+        run: |
+          lime-cli report --started \
+            --run-id "${{ github.run_id }}-${{ matrix.platform }}" \
+            --platform "${{ matrix.platform }}" \
+            --branch "${{ inputs.app_branch || github.ref_name }}" \
+            ${RUN_NAME:+--title "$RUN_NAME"}
+
+      # `|| true` is deliberate: A FAILING TEST IS A RESULT, and the reporting step below
+      # must still run and post it. The job's verdict is set at the end from the saved exit
+      # code, so a red suite still turns this job red.
+      #
+      # The device and OS variables are set for BOTH platforms on every leg — taqwright
+      # reads only the pair matching the project it is running, so the unused pair is
+      # inert, and branching here would be two more places to get wrong.
+      - name: Run the suite
+        id: run
+        env:
+          LAMBDATEST_USERNAME: ${{ secrets.LAMBDATEST_USERNAME }}
+          LAMBDATEST_ACCESS_KEY: ${{ secrets.LAMBDATEST_ACCESS_KEY }}
+          LT_ANDROID_DEVICE: ${{ inputs.device || vars.LT_ANDROID_DEVICE }}
+          LT_ANDROID_OS: ${{ inputs.os_version || vars.LT_ANDROID_OS }}
+          LT_IOS_DEVICE: ${{ inputs.device || vars.LT_IOS_DEVICE }}
+          LT_IOS_OS: ${{ inputs.os_version || vars.LT_IOS_OS }}
+          LT_APP_ID_ANDROID: ${{ inputs.app_id || vars.LT_APP_ID_ANDROID || env.DEFAULT_APP_ID_ANDROID }}
+          LT_APP_ID_IOS: ${{ inputs.app_id || vars.LT_APP_ID_IOS || env.DEFAULT_APP_ID_IOS }}
+          # The ${NAME} variables the goals were recorded with. The specs read them from
+          # the environment rather than carrying the values — the whole point of the
+          # contract is that what was typed into the app never reaches the repository.
+          # ── EDIT ME ──────────────────────────────────────────────────────────
+          # One line per ${NAME} your recordings use. The name on the left is what
+          # the spec reads; the secret on the right is where the value lives. Add
+          # the same pair to the other workflow, or the suite passes on one trigger
+          # and fails on the other.
+          APP_USER: ${{ secrets.APP_USER }}
+          APP_PASS: ${{ secrets.APP_PASS }}
+          # Playwright's json reporter writes to STDOUT unless this names a file, and
+          # stdout is not usable: taqwright pipes the runner's output through a branding
+          # rewrite, so a redirect captures branded text rather than clean JSON.
+          PLAYWRIGHT_JSON_OUTPUT_NAME: results.json
+          GREP: ${{ inputs.grep }}
+        run: |
+          set +e
+          npx taqwright test --project "${{ matrix.platform }}" --reporter json ${GREP:+--grep "$GREP"}
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          set -e
+          echo "Wrote $(wc -c < results.json 2>/dev/null || echo 0) bytes of results."
+          # WHAT THE REPORTER IS ABOUT TO LOOK AT. `--screens lime-screens` resolves against
+          # THIS step's directory while the capture hook resolves its own; when a failure
+          # produces "no screens to send", this line is what tells you whether the file is
+          # missing or merely somewhere else.
+          echo "cwd: $PWD"; ls -la lime-screens 2>/dev/null || echo "lime-screens: absent"
+
+      # Always, including on failure — a red suite is exactly the result worth having on
+      # the board. Skipped only when the run was started with report=false, which is for
+      # trying a device out without writing history.
+      - name: Report the results to LIME
+        if: always() && inputs.report != false
+        env:
+          LIME_CI_TOKEN: ${{ secrets.LIME_CI_TOKEN }}
+          LAMBDATEST_USERNAME: ${{ secrets.LAMBDATEST_USERNAME }}
+          LAMBDATEST_ACCESS_KEY: ${{ secrets.LAMBDATEST_ACCESS_KEY }}
+          DEVICE: ${{ inputs.device }}
+          OS_VERSION: ${{ inputs.os_version }}
+          # The SAME chain the suite resolves above, per platform. It was one expression
+          # naming LT_APP_ID_ANDROID on both legs, so an iOS run reported the Android
+          # build -- inert while iOS had no build of its own, and no longer inert now that
+          # it has. Chosen in the shell below, in the branch that already exists for the
+          # device label.
+          APP_ID_ANDROID: ${{ inputs.app_id || vars.LT_APP_ID_ANDROID || env.DEFAULT_APP_ID_ANDROID }}
+          APP_ID_IOS: ${{ inputs.app_id || vars.LT_APP_ID_IOS || env.DEFAULT_APP_ID_IOS }}
+          # WHAT TO CALL THIS RUN on the Reports rail. The rail names a run
+          # `title || branch || sha`, so leaving this blank keeps today's behaviour — and
+          # is exactly why two dispatches of main were indistinguishable: both read
+          # "main / 7b55bd6" with nothing to tell them apart.
+          #
+          # `${VAR:+…}` so an unset name passes no flag at all rather than an empty
+          # --title, which would be stored as a name and beat the branch fallback.
+          #
+          # Free text, and PII-redacted server-side like a commit message — a run name is
+          # typed in a hurry and "rerun for bob@acme.com" is a real thing people write.
+          RUN_NAME: ${{ inputs.run_name }}
+        run: |
+          [ -f results.json ] || { echo "No results.json — the suite did not get far enough to report."; exit 0; }
+
+          # WHAT IT RAN ON, for the Reports table and the pull request summary. Neither is
+          # derivable at the other end: this runner is not the handset, and Playwright's
+          # json reporter does not serialise a project's `use` options, so the config's own
+          # device is not in results.json either.
+          #
+          # `${VAR:+…}` on purpose: an unset variable produces an empty string and LIME
+          # then omits the column, which is the honest answer. Written the other way an
+          # unset device reports " · Android " and puts a half-empty label on every row.
+          if [ "${{ matrix.platform }}" = "ios" ]; then
+            NAME="${DEVICE:-${{ vars.LT_IOS_DEVICE }}}"; OSV="${OS_VERSION:-${{ vars.LT_IOS_OS }}}"
+            LABEL="${NAME:+$NAME · iOS $OSV}"; APP_ID="$APP_ID_IOS"
+          else
+            NAME="${DEVICE:-${{ vars.LT_ANDROID_DEVICE }}}"; OSV="${OS_VERSION:-${{ vars.LT_ANDROID_OS }}}"
+            LABEL="${NAME:+$NAME · Android $OSV}"; APP_ID="$APP_ID_ANDROID"
+          fi
+
+          # TWO IDENTIFIERS, not one. --run-id names this run on LIME's board and carries
+          # the platform, because a matrix gives both legs the same github.run_id and they
+          # have to be distinguishable there. --build-marker matches the grid's build_name,
+          # which the suite stamps as "CI <github.run_id>" and which knows nothing about the
+          # matrix. Passing the suffixed id for both matched no session, so every regression
+          # run reported with no video link.
+          #
+          # Written HERE and not between the flags: a `#` inside a backslash continuation
+          # ENDS it, so bash ran the report without its remaining flags and then tried to
+          # execute `--build-marker` as a command. Exit 127, after a report that had already
+          # succeeded with the wrong arguments.
+          lime-cli report \
+            --results results.json \
+            --screens lime-screens \
+            --platform "${{ matrix.platform }}" \
+            ${RUN_NAME:+--title "$RUN_NAME"} \
+            --commit "${{ inputs.app_commit || github.sha }}" \
+            --build-marker "${{ github.run_id }}" \
+            --branch "${{ inputs.app_branch || github.ref_name }}" \
+            --actor "${{ github.actor }}" \
+            --device "$LABEL" \
+            --app-version "$APP_ID" \
+            --run-id "${{ github.run_id }}-${{ matrix.platform }}"
+
+      # Kept last so a failing suite fails the job. The report above has already been sent
+      # by the time this runs — which is the whole ordering that matters in this file.
+      - name: Fail if the suite failed
+        if: always() && steps.run.outputs.exit_code != '0'
+        run: |
+          echo "::error::The suite failed on ${{ matrix.platform }} (exit ${{ steps.run.outputs.exit_code }}). The results were still reported to LIME."
+          exit 1
